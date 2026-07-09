@@ -1,8 +1,12 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using ClickHouse.Driver.Tcp.Format;
+using ClickHouse.Driver.Tcp.Types;
 
 namespace ClickHouse.Driver.Tcp.Protocol;
 
@@ -25,6 +29,7 @@ internal sealed class ClickHouseTcpConnection : IDisposable, IAsyncDisposable
     private readonly ClickHouseBinaryReader reader;
     private readonly ClickHouseBinaryWriter writer;
     private ServerHandshake server;
+    private ClientHandshakeParameters clientParameters;
     private TcpConnectionState state;
 
     /// <summary>
@@ -165,6 +170,158 @@ internal sealed class ClickHouseTcpConnection : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Runs a query and streams its result as a sequence of <see cref="Block"/>s. Sends the Query and the
+    /// empty end-of-input marker, then drains the response, yielding each row-bearing Data block; interleaved
+    /// Progress/ProfileInfo/ProfileEvents/Log/TableColumns/Totals/Extremes packets are consumed to keep the
+    /// stream aligned but are not surfaced.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Blocks are borrowed.</b> Each yielded <see cref="Block"/> is valid only for the current iteration of
+    /// the enumeration. The enumerator owns the block's storage and
+    /// releases it automatically when you advance to the next block, stop enumerating, or dispose the
+    /// enumerator. So do <b>not</b> dispose a yielded block yourself, and do <b>not</b> retain a block, any of
+    /// its columns, or an <see cref="IColumn{T}.Values"/> span past the current iteration. To keep data beyond
+    /// the loop body, copy it out while iterating (for example <c>((IColumn&lt;ulong&gt;)block[0]).Values.ToArray()</c>).
+    /// </para>
+    /// <example>
+    /// <code>
+    /// await foreach (Block block in connection.QueryAsync("SELECT number FROM system.numbers LIMIT 10"))
+    /// {
+    ///     // Read or copy within the loop body; the block is released once the loop advances.
+    ///     foreach (ulong value in ((IColumn&lt;ulong&gt;)block[0]).Values)
+    ///     {
+    ///         // ...
+    ///     }
+    /// }
+    /// </code>
+    /// </example>
+    /// </remarks>
+    /// <param name="sql">The SQL text.</param>
+    /// <param name="settings">Per-query settings as textual values, or null for none.</param>
+    /// <param name="parameters">Query parameter values in SQL representation, or null for none.</param>
+    /// <param name="queryId">The query id, or null to let the server assign one.</param>
+    /// <param name="cancellationToken">A token to observe for cancellation.</param>
+    /// <returns>An async stream of the result's row-bearing blocks, each valid only for its own iteration.</returns>
+    /// <exception cref="InvalidOperationException">The connection is busy with another operation.</exception>
+    /// <exception cref="ObjectDisposedException">The connection has been terminated.</exception>
+    /// <exception cref="ClickHouseServerException">The server reported an error while executing the query.</exception>
+    /// <exception cref="ClickHouseProtocolException">The server sent an unexpected packet.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    internal async IAsyncEnumerable<Block> QueryAsync(
+        string sql,
+        IReadOnlyDictionary<string, string> settings = null,
+        IReadOnlyDictionary<string, string> parameters = null,
+        string queryId = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(sql);
+        BeginOperation();
+
+        NegotiatedProtocol negotiated = server.Negotiated;
+        ClickHouseServerException pending = null;
+        Block current = null;
+        bool completed = false;
+        try
+        {
+            Query.Write(writer, negotiated, clientParameters, queryId, sql, settings, parameters);
+            writer.WriteClientPacketType(ClientPacketType.Data);
+            BlockWriter.WriteEmptyBlock(writer);
+            await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+            while (true)
+            {
+                // Resuming here means the consumer has advanced past the previously yielded block, so its
+                // borrowed (possibly pooled) buffers can be released before we read the next packet.
+                if (current is not null)
+                {
+                    current.Dispose();
+                    current = null;
+                }
+
+                ServerPacketType packet = await reader.ReadServerPacketTypeAsync(cancellationToken).ConfigureAwait(false);
+
+                if (packet == ServerPacketType.EndOfStream)
+                {
+                    completed = true;
+                    break;
+                }
+
+                if (packet == ServerPacketType.Exception)
+                {
+                    pending = await ClickHouseServerException.ReadAsync(reader, cancellationToken).ConfigureAwait(false);
+                    completed = true;
+                    break;
+                }
+
+                switch (packet)
+                {
+                    case ServerPacketType.Data:
+                    {
+                        Block block = await BlockReader.ReadBlockAsync(reader, negotiated, ColumnCodecRegistry.Default, cancellationToken).ConfigureAwait(false);
+                        if (block.RowCount != 0)
+                        {
+                            // Held as the current block so it is released when the consumer advances or stops.
+                            current = block;
+                            yield return block;
+                        }
+                        else
+                        {
+                            block.Dispose();
+                        }
+
+                        break;
+                    }
+                    // The remaining metadata packets are decoded only to stay stream-aligned; their values are
+                    // not surfaced yet. TODO: surface. The block-bearing ones are released immediately.
+                    case ServerPacketType.Totals:
+                    case ServerPacketType.Extremes:
+                    case ServerPacketType.ProfileEvents:
+                    case ServerPacketType.Log:
+                        (await BlockReader.ReadBlockAsync(reader, negotiated, ColumnCodecRegistry.Default, cancellationToken).ConfigureAwait(false)).Dispose();
+                        break;
+                    
+                    case ServerPacketType.Progress:
+                        await Progress.ReadAsync(reader, negotiated, cancellationToken).ConfigureAwait(false);
+                        break;
+
+                    case ServerPacketType.ProfileInfo:
+                        await ProfileInfo.ReadAsync(reader, cancellationToken).ConfigureAwait(false);
+                        break;
+
+                    case ServerPacketType.TableColumns:
+                        await TableColumns.ReadAsync(reader, cancellationToken).ConfigureAwait(false);
+                        break;
+
+                    default:
+                        // Only the packets above are valid in a query response at this protocol target; anything
+                        // else (e.g. TimezoneUpdate, PartUUIDs, a read-task request) is a violation here.
+                        throw new ClickHouseProtocolException($"Unexpected packet type {packet} ({(ulong)packet}) in query response.");
+                }
+            }
+        }
+        finally
+        {
+            // Release the last yielded block (still current) on end-of-stream, early disposal, or error.
+            current?.Dispose();
+
+            if (completed)
+            {
+                state = TcpConnectionState.Ready;
+            }
+            else
+            {
+                Terminate();
+            }
+        }
+
+        if (pending is not null)
+        {
+            throw pending;
+        }
+    }
+
+    /// <summary>
     /// A teardown primitive: sends a Cancel to let the server abort the running query sooner, best effort,
     /// then terminates the connection. Draining the remaining response is not required, and a half-read stream
     /// cannot be safely reused, so the connection is discarded either way — a send failure is swallowed since
@@ -238,6 +395,7 @@ internal sealed class ClickHouseTcpConnection : IDisposable, IAsyncDisposable
     /// <returns>A task that completes when the handshake succeeds.</returns>
     internal async ValueTask HandshakeAsync(ClientHandshakeParameters handshake, CancellationToken cancellationToken)
     {
+        clientParameters = handshake;
         try
         {
             server = await Handshake.PerformAsync(reader, writer, handshake, cancellationToken).ConfigureAwait(false);
